@@ -4,6 +4,7 @@ import Parser from 'rss-parser';
 import OpenAI from 'openai';
 import { Resend } from 'resend';
 import { marked } from 'marked';
+import * as cheerio from 'cheerio';
 import { config } from '../src/config.js';
 
 // OpenRouter for text generation
@@ -16,7 +17,6 @@ const ai = new OpenAI({
   }
 });
 
-// Optional Native OpenAI for TTS (OpenRouter doesn't support TTS yet)
 const ttsAi = process.env.OPENAI_API_KEY_AUDIO ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY_AUDIO }) : null;
 
 const parser = new Parser();
@@ -32,6 +32,7 @@ interface RawArticle {
 interface ProcessedArticle extends RawArticle {
   score: number;
   summary: string;
+  deepContent?: string;
 }
 
 // 1. Fetch RSS
@@ -64,7 +65,7 @@ async function fetchRSSConfig(): Promise<RawArticle[]> {
   return articles;
 }
 
-// 2. Fetch Reddit (V2 Feature)
+// 2. Fetch Reddit
 async function fetchRedditConfig(): Promise<RawArticle[]> {
   const articles: RawArticle[] = [];
   if (!config.sources.reddit) return articles;
@@ -72,7 +73,6 @@ async function fetchRedditConfig(): Promise<RawArticle[]> {
   console.log(`Fetching top tech Reddit posts...`);
   for (const sub of config.sources.reddit) {
     try {
-      // Use standard fetch to get top 3 daily posts
       const res = await fetch(`https://www.reddit.com/r/${sub}/top.json?t=day&limit=3`, {
         headers: { 'User-Agent': 'DailyDigestBot/1.0' }
       });
@@ -140,29 +140,32 @@ Provide your response in JSON format exactly like this:
   return processed;
 }
 
-// 4. Synthesize
+// 4. Synthesize with Deep Context & Auto-Tweeter
 async function synthesizeDigest(articles: ProcessedArticle[]): Promise<string> {
-  console.log(`Synthesizing final digest with ${config.ai.modelPro} from ${articles.length} top articles...`);
+  console.log(`Synthesizing massive digest with ${config.ai.modelPro} from full HTML contexts...`);
   
   let contentList = articles.map(a => 
-    `Source: ${a.source}\nTitle: ${a.title}\nLink: ${a.link}\nSummary: ${a.summary}\n---`
+    `Source: ${a.source}\nTitle: ${a.title}\nLink: ${a.link}\nDeep Content/Summary:\n${a.deepContent || a.summary}\n---`
   ).join('\n');
 
   const prompt = `
 You are an elite Tech Newsletter Editor. 
-I am turning these curated, highly relevant articles from the last 24 hours into my personal daily digest.
+I am turning these curated, heavily context-rich articles from the last 24 hours into my personal daily digest.
 
-Here are the articles:
+Here is the deep-scraped text for today's top stories:
 ${contentList}
 
 Write a premium, highly readable Daily Digest in Markdown format.
 Structure the digest as follows:
-- Catchy Headline: Give this edition a creative, insightful title (e.g. ## **AI Models Shrink While Capabilities Explode**)
 - Executive Summary: A short introductory paragraph highlighting the overall theme of the day.
-- Top Stories: For the 3-4 absolute most important articles, write a cohesive, insightful 1-paragraph synthesis each. Include the Markdown hyperlink [Title](Link) naturally in the text.
-- Quick Hits: A bulleted list of the remaining interesting articles, using their summaries. Format: - [Title](Link): Summary.
+- Top Stories: For the top articles, write a cohesive, insightful 1-paragraph synthesis each. Include the Markdown hyperlink [Title](Link) naturally in the text.
+- Quick Hits: A bulleted list of the remaining interesting articles. Format: - [Title](Link): Summary.
 
-DO NOT use an overall Markdown # Heading 1 for the title because the frontend already renders the Date Header.
+CRITICAL V5 INSTRUCTION (DIGITAL TWIN PROTOCOL):
+At the absolute bottom of your digest, add a horizontal rule \`---\`.
+Below it, write a single, highly engaging, slightly visionary Tweet (under 280 chars) summarizing your most impactful takeaway. 
+Format it EXACTLY like this so the script can parse it:
+**Auto-Tweet:** <the tweet text goes here>
 `;
 
   const response = await ai.chat.completions.create({
@@ -175,7 +178,7 @@ DO NOT use an overall Markdown # Heading 1 for the title because the frontend al
 
 // MAIN EXECUTION
 async function main() {
-  console.log('--- Starting Daily Digest Pipeline (V2) ---');
+  console.log('--- Starting Daily Digest V5 Pipeline ---');
   
   const rawRss = await fetchRSSConfig();
   const rawReddit = await fetchRedditConfig();
@@ -190,10 +193,35 @@ async function main() {
     .filter(a => a.score >= config.ai.relevanceThreshold)
     .sort((a, b) => b.score - a.score);
     
-  console.log(`Filtered down to ${filteredArticles.length} highly relevant articles.`);
+  console.log(`Filtered down to ${filteredArticles.length} highly relevant articles. Initiating Kinetic Deep Scrape...`);
   if (filteredArticles.length === 0) return;
 
-  const markdownDigest = await synthesizeDigest(filteredArticles);
+  // V5 Kinetic Scraper: Deep fetch the top 4 articles for maximum PhD-level context
+  const deepArticles = [];
+  for (const article of filteredArticles.slice(0, 4)) {
+    try {
+      console.log(`Deep scraping full HTML context for: ${article.title}`);
+      const res = await fetch(article.link, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' } });
+      const html = await res.text();
+      const $ = cheerio.load(html);
+      
+      // Strip navigation, ads, and scripts to isolate core article body
+      $('script, style, nav, footer, iframe, img, aside, header').remove();
+      const fullText = $('body').text().replace(/\\s+/g, ' ').trim().substring(0, 6000); // 6k chars is approx 1500 tokens
+      
+      deepArticles.push({ ...article, deepContent: fullText || article.contentSnippet });
+    } catch(e) {
+      console.error(`Scrape failed for ${article.link}, falling back to RSS snippet.`);
+      deepArticles.push({ ...article, deepContent: article.contentSnippet });
+    }
+  }
+  
+  // Add remaining non-deep scraped items for Quick Hits
+  for (const article of filteredArticles.slice(4)) {
+    deepArticles.push({ ...article, deepContent: article.contentSnippet });
+  }
+
+  const markdownDigest = await synthesizeDigest(deepArticles);
   const dateStr = new Date().toISOString().split('T')[0];
   
   const outDir = path.join(process.cwd(), 'content', 'digests');
@@ -204,13 +232,12 @@ async function main() {
   fs.writeFileSync(outPath, markdownDigest);
   console.log(`Saved Markdown to ${outPath}`);
 
-  // 2. Generate Audio TTS (If native OpenAI Key provided)
+  // 2. Generate Audio TTS 
   let audioBuffer: Buffer | null = null;
   if (ttsAi) {
     try {
       console.log('Generating podcast audio via OpenAI TTS...');
-      // Strip markdown syntax for the reader
-      const cleanText = markdownDigest.replace(/[\#\*\_\[\]\(\)]/g, ''); 
+      const cleanText = markdownDigest.replace(/[\\#\\*\\[\\]\\(\\)\\-]/g, ''); 
       const mp3Response = await ttsAi.audio.speech.create({
         model: 'tts-1-hd',
         voice: 'alloy',
@@ -228,28 +255,35 @@ async function main() {
     }
   }
 
-  // 3. Telegram Delivery
+  // 3. Telegram Delivery with Native Auto-Tweeter
   const tgToken = config.delivery.telegram.botToken;
   const tgChatId = config.delivery.telegram.chatId;
   
   if (tgToken && tgChatId) {
-    console.log('Sending digest to Telegram...');
+    console.log('Sending V5 digest to Telegram...');
     try {
       let textToSend = markdownDigest;
+      
+      // Extract the Auto-Tweet to build the intent URL
+      const tweetMatch = markdownDigest.match(/\\*\\*Auto-Tweet:\\*\\*\\s*(.+)/);
+      if (tweetMatch && tweetMatch[1]) {
+        const rawTweet = tweetMatch[1].trim();
+        const tweetUrl = `https://twitter.com/intent/tweet?text=${encodeURIComponent(rawTweet)}`;
+        textToSend += `\\n\\n[🐦 **Tap to Publish as your Digital Twin**](${tweetUrl})`;
+        console.log('Successfully generated Auto-Tweet deep-link.');
+      }
+
       if (textToSend.length > 4000) {
-        textToSend = textToSend.substring(0, 4000) + '\n\n...[Read the rest on the full site]';
+        textToSend = textToSend.substring(0, 4000) + '\\n\\n...[Read the rest on the full site]';
       }
       
-      // Send text
       await fetch(`https://api.telegram.org/bot${tgToken}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ chat_id: tgChatId, text: textToSend, parse_mode: 'Markdown' })
       });
       
-      // Send audio if generated
       if (audioBuffer) {
-        console.log('Sending audio podcast to Telegram...');
         const formData = new FormData();
         formData.append('chat_id', tgChatId);
         formData.append('audio', new Blob([audioBuffer], { type: 'audio/mpeg' }), `${dateStr}_Podcast.mp3`);
@@ -265,13 +299,11 @@ async function main() {
     }
   }
 
-  // 4. Obsidian Local Injection (V4 Feature)
+  // 4. Obsidian Local Injection
   try {
     const obsidianVault = path.join(process.env.HOME || '/Users/youssef', 'Library', 'Mobile Documents', 'iCloud~md~obsidian', 'Documents', 'first');
     if (fs.existsSync(obsidianVault)) {
       console.log("Obsidian vault detected locally! Scanning for today's Daily Note...");
-      
-      // Recursive search for the daily note (YYYY-MM-DD.md)
       let targetFile = '';
       const searchForNote = (dir: string) => {
         const files = fs.readdirSync(dir);
@@ -286,20 +318,19 @@ async function main() {
       };
       searchForNote(obsidianVault);
 
-      const appendBlock = `\n\n## Automated Intelligence\n*Synthesized context inserted by Daily Digest Pipeline:*\n\n${markdownDigest}\n`;
+      const appendBlock = `\\n\\n## Automated Intelligence\\n*Synthesized context inserted by Daily Digest Pipeline:*\\n\\n${markdownDigest}\\n`;
 
       if (targetFile) {
         fs.appendFileSync(targetFile, appendBlock);
         console.log(`Successfully injected digest directly into your Obsidian Daily Note: ${targetFile}`);
       } else {
-        // Create it in the root if it doesn't exist
         const newNotePath = path.join(obsidianVault, `${dateStr}.md`);
         fs.writeFileSync(newNotePath, `# Daily Note: ${dateStr}${appendBlock}`);
         console.log(`Created new Obsidian Daily Note and injected digest: ${newNotePath}`);
       }
     }
   } catch (e) {
-    console.error('Obsidian injection failed (likely running in cloud environment without iCloud access):', e);
+    console.error('Obsidian injection failed:', e);
   }
 }
 
