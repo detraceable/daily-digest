@@ -264,6 +264,43 @@ async function main() {
       console.error('Failed to send to Telegram:', e);
     }
   }
+
+  // 4. Obsidian Local Injection (V4 Feature)
+  try {
+    const obsidianVault = path.join(process.env.HOME || '/Users/youssef', 'Library', 'Mobile Documents', 'iCloud~md~obsidian', 'Documents', 'first');
+    if (fs.existsSync(obsidianVault)) {
+      console.log("Obsidian vault detected locally! Scanning for today's Daily Note...");
+      
+      // Recursive search for the daily note (YYYY-MM-DD.md)
+      let targetFile = '';
+      const searchForNote = (dir: string) => {
+        const files = fs.readdirSync(dir);
+        for (const file of files) {
+          const fullPath = path.join(dir, file);
+          if (fs.statSync(fullPath).isDirectory() && !file.startsWith('.')) {
+            searchForNote(fullPath);
+          } else if (file === `${dateStr}.md`) {
+            targetFile = fullPath;
+          }
+        }
+      };
+      searchForNote(obsidianVault);
+
+      const appendBlock = `\n\n## Automated Intelligence\n*Synthesized context inserted by Daily Digest Pipeline:*\n\n${markdownDigest}\n`;
+
+      if (targetFile) {
+        fs.appendFileSync(targetFile, appendBlock);
+        console.log(`Successfully injected digest directly into your Obsidian Daily Note: ${targetFile}`);
+      } else {
+        // Create it in the root if it doesn't exist
+        const newNotePath = path.join(obsidianVault, `${dateStr}.md`);
+        fs.writeFileSync(newNotePath, `# Daily Note: ${dateStr}${appendBlock}`);
+        console.log(`Created new Obsidian Daily Note and injected digest: ${newNotePath}`);
+      }
+    }
+  } catch (e) {
+    console.error('Obsidian injection failed (likely running in cloud environment without iCloud access):', e);
+  }
 }
 
 main().catch(console.error);
