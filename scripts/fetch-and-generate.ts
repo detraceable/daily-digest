@@ -6,7 +6,7 @@ import { Resend } from 'resend';
 import { marked } from 'marked';
 import { config } from '../src/config.js';
 
-// 1. Initialize
+// OpenRouter for text generation
 const ai = new OpenAI({ 
   baseURL: 'https://openrouter.ai/api/v1',
   apiKey: process.env.OPENROUTER_API_KEY,
@@ -15,6 +15,10 @@ const ai = new OpenAI({
     'X-Title': 'Daily Digest Pipeline'
   }
 });
+
+// Optional Native OpenAI for TTS (OpenRouter doesn't support TTS yet)
+const ttsAi = process.env.OPENAI_API_KEY_AUDIO ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY_AUDIO }) : null;
+
 const parser = new Parser();
 
 interface RawArticle {
@@ -30,6 +34,7 @@ interface ProcessedArticle extends RawArticle {
   summary: string;
 }
 
+// 1. Fetch RSS
 async function fetchRSSConfig(): Promise<RawArticle[]> {
   const articles: RawArticle[] = [];
   const oneDayAgo = new Date();
@@ -59,21 +64,57 @@ async function fetchRSSConfig(): Promise<RawArticle[]> {
   return articles;
 }
 
+// 2. Fetch Reddit (V2 Feature)
+async function fetchRedditConfig(): Promise<RawArticle[]> {
+  const articles: RawArticle[] = [];
+  if (!config.sources.reddit) return articles;
+
+  console.log(`Fetching top tech Reddit posts...`);
+  for (const sub of config.sources.reddit) {
+    try {
+      // Use standard fetch to get top 3 daily posts
+      const res = await fetch(`https://www.reddit.com/r/${sub}/top.json?t=day&limit=3`, {
+        headers: { 'User-Agent': 'DailyDigestBot/1.0' }
+      });
+      if (!res.ok) continue;
+      
+      const data = await res.json();
+      const posts = data.data?.children || [];
+
+      for (const p of posts) {
+        const post = p.data;
+        if (!post.title) continue;
+        articles.push({
+          title: `[Reddit ${sub}] ${post.title}`,
+          link: `https://reddit.com${post.permalink}`,
+          source: `r/${sub}`,
+          contentSnippet: (post.selftext || "External link/Media").substring(0, 500),
+          pubDate: new Date(post.created_utc * 1000).toISOString()
+        });
+      }
+    } catch (err) {
+      console.error(`Failed to fetch reddit /r/${sub}:`, err);
+    }
+  }
+  return articles;
+}
+
+// 3. Map & Score
 async function mapAndScore(articles: RawArticle[]): Promise<ProcessedArticle[]> {
   const processed: ProcessedArticle[] = [];
-  console.log(`Scoring ${articles.length} articles with ${config.ai.modelFlash}...`);
+  console.log(`Scoring ${articles.length} total items with ${config.ai.modelFlash}...`);
   
   for (const article of articles) {
     try {
       const prompt = `
-You are a content curator. Evaluate this article for a technology enthusiast.
+You are a content curator. Evaluate this piece of information for a technology enthusiast.
 Title: ${article.title}
 Snippet: ${article.contentSnippet}
 
 Provide your response in JSON format exactly like this:
 {
   "score": <number 1-10 based on relevance to tech/AI/programming>,
-  "summary": "<a punchy, engaging 1-2 sentence summary of the article>"
+  "summary": "<a punchy, engaging 1-2 sentence summary>"
 }`;
 
       const response = await ai.chat.completions.create({
@@ -86,7 +127,6 @@ Provide your response in JSON format exactly like this:
       if (!text) continue;
       
       const result = JSON.parse(text);
-      
       processed.push({
         ...article,
         score: result.score || 1,
@@ -97,10 +137,10 @@ Provide your response in JSON format exactly like this:
       console.error(`Failed to process article: ${article.title}`);
     }
   }
-  
   return processed;
 }
 
+// 4. Synthesize
 async function synthesizeDigest(articles: ProcessedArticle[]): Promise<string> {
   console.log(`Synthesizing final digest with ${config.ai.modelPro} from ${articles.length} top articles...`);
   
@@ -122,7 +162,7 @@ Structure the digest as follows:
 - Top Stories: For the 3-4 absolute most important articles, write a cohesive, insightful 1-paragraph synthesis each. Include the Markdown hyperlink [Title](Link) naturally in the text.
 - Quick Hits: A bulleted list of the remaining interesting articles, using their summaries. Format: - [Title](Link): Summary.
 
-DO NOT use an overall Markdown # Heading 1 for the title because the frontend already renders the Date Header. Keep the styling clean and engaging.
+DO NOT use an overall Markdown # Heading 1 for the title because the frontend already renders the Date Header.
 `;
 
   const response = await ai.chat.completions.create({
@@ -133,11 +173,15 @@ DO NOT use an overall Markdown # Heading 1 for the title because the frontend al
   return response.choices[0].message?.content || "Failed to generate digest.";
 }
 
+// MAIN EXECUTION
 async function main() {
-  console.log('--- Starting Daily Digest Pipeline ---');
+  console.log('--- Starting Daily Digest Pipeline (V2) ---');
   
-  const rawArticles = await fetchRSSConfig();
-  console.log(`Found ${rawArticles.length} articles from the last 24 hours.`);
+  const rawRss = await fetchRSSConfig();
+  const rawReddit = await fetchRedditConfig();
+  const rawArticles = [...rawRss, ...rawReddit];
+  
+  console.log(`Found ${rawArticles.length} combined items from the last 24 hours.`);
   if (rawArticles.length === 0) return;
 
   const processedArticles = await mapAndScore(rawArticles);
@@ -150,40 +194,41 @@ async function main() {
   if (filteredArticles.length === 0) return;
 
   const markdownDigest = await synthesizeDigest(filteredArticles);
-  
   const dateStr = new Date().toISOString().split('T')[0];
+  
   const outDir = path.join(process.cwd(), 'content', 'digests');
-  if (!fs.existsSync(outDir)) {
-    fs.mkdirSync(outDir, { recursive: true });
-  }
+  if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
 
+  // 1. Save Markdown
   const outPath = path.join(outDir, `${dateStr}.md`);
   fs.writeFileSync(outPath, markdownDigest);
-  console.log(`\nSuccess! Digest saved to ${outPath}`);
+  console.log(`Saved Markdown to ${outPath}`);
 
-  // ------------- DELIVERY ------------- 
-
-  // 1. Email via Resend
-  const resendApiKey = process.env.RESEND_API_KEY;
-  if (resendApiKey && config.delivery.emailTo) {
-    console.log('Sending email digest via Resend...');
-    const resend = new Resend(resendApiKey);
-    const htmlDigest = await marked.parse(markdownDigest);
-    
+  // 2. Generate Audio TTS (If native OpenAI Key provided)
+  let audioBuffer: Buffer | null = null;
+  if (ttsAi) {
     try {
-      await resend.emails.send({
-        from: config.delivery.emailFrom,
-        to: config.delivery.emailTo,
-        subject: `Daily Digest: ${dateStr}`,
-        html: `<div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; line-height: 1.6;">${htmlDigest}</div>`
+      console.log('Generating podcast audio via OpenAI TTS...');
+      // Strip markdown syntax for the reader
+      const cleanText = markdownDigest.replace(/[\#\*\_\[\]\(\)]/g, ''); 
+      const mp3Response = await ttsAi.audio.speech.create({
+        model: 'tts-1-hd',
+        voice: 'alloy',
+        input: `Welcome to your Daily Digest for ${dateStr}. ${cleanText.substring(0, 4000)}` 
       });
-      console.log('Email sent successfully!');
+      audioBuffer = Buffer.from(await mp3Response.arrayBuffer());
+      
+      const audioDir = path.join(process.cwd(), 'content', 'audio');
+      if (!fs.existsSync(audioDir)) fs.mkdirSync(audioDir, { recursive: true });
+      const audioPath = path.join(audioDir, `${dateStr}.mp3`);
+      fs.writeFileSync(audioPath, audioBuffer);
+      console.log(`Saved Podcast to ${audioPath}`);
     } catch (e) {
-      console.error('Failed to send email:', e);
+      console.error('Failed to generate audio TTS:', e);
     }
   }
 
-  // 2. Telegram Bot
+  // 3. Telegram Delivery
   const tgToken = config.delivery.telegram.botToken;
   const tgChatId = config.delivery.telegram.chatId;
   
@@ -191,26 +236,30 @@ async function main() {
     console.log('Sending digest to Telegram...');
     try {
       let textToSend = markdownDigest;
-      // Telegram has a 4096 char limit. Truncate if necessary.
       if (textToSend.length > 4000) {
         textToSend = textToSend.substring(0, 4000) + '\n\n...[Read the rest on the full site]';
       }
       
-      const res = await fetch(`https://api.telegram.org/bot${tgToken}/sendMessage`, {
+      // Send text
+      await fetch(`https://api.telegram.org/bot${tgToken}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: tgChatId,
-          text: textToSend,
-          parse_mode: 'Markdown'
-        })
+        body: JSON.stringify({ chat_id: tgChatId, text: textToSend, parse_mode: 'Markdown' })
       });
       
-      if (!res.ok) {
-        console.error('Telegram API error:', await res.text());
-      } else {
-        console.log('Successfully sent to Telegram!');
+      // Send audio if generated
+      if (audioBuffer) {
+        console.log('Sending audio podcast to Telegram...');
+        const formData = new FormData();
+        formData.append('chat_id', tgChatId);
+        formData.append('audio', new Blob([audioBuffer], { type: 'audio/mpeg' }), `${dateStr}_Podcast.mp3`);
+        
+        await fetch(`https://api.telegram.org/bot${tgToken}/sendAudio`, {
+          method: 'POST',
+          body: formData as any
+        });
       }
+      console.log('Successfully delivered to Telegram!');
     } catch (e) {
       console.error('Failed to send to Telegram:', e);
     }

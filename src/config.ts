@@ -4,7 +4,8 @@ export const config = {
       { id: 'techcrunch', url: 'https://techcrunch.com/feed/', category: 'Technology' },
       { id: 'hackernews', url: 'https://hnrss.org/frontpage', category: 'Tech News' },
       { id: 'verge', url: 'https://www.theverge.com/rss/index.xml', category: 'Technology' }
-    ]
+    ],
+    reddit: ['MachineLearning', 'programming', 'LocalLLaMA']
   },
   ai: {
     // Fast, cheap model for mapping/scoring (guaranteed JSON compatibility)
